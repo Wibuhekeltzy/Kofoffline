@@ -1,0 +1,117 @@
+
+name: Copy GitHub Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Original repository (owner/repo)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  copy-releases:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Copy all releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE: ${{ inputs.source_repo }}
+          TARGET: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$SOURCE" == "$TARGET" ]]; then
+            echo "Source and destination cannot be the same."
+            exit 1
+          fi
+
+          echo "Source: $SOURCE"
+          echo "Destination: $TARGET"
+
+          gh api --paginate --slurp \
+            "repos/$SOURCE/releases?per_page=100" \
+            > releases.json
+
+          count=$(jq '[.[][]] | length' releases.json)
+          echo "Found $count releases."
+
+          if [[ "$count" -eq 0 ]]; then
+            echo "No published releases found."
+            exit 0
+          fi
+
+          jq -c '.[][]' releases.json |
+          while IFS= read -r release; do
+
+            tag=$(jq -r '.tag_name' <<< "$release")
+            name=$(jq -r '.name // .tag_name' <<< "$release")
+            body=$(jq -r '.body // ""' <<< "$release")
+            draft=$(jq -r '.draft' <<< "$release")
+            prerelease=$(jq -r '.prerelease' <<< "$release")
+            target_commitish=$(jq -r '.target_commitish // "main"' <<< "$release")
+            assets=$(jq '.assets | length' <<< "$release")
+
+            echo "Processing release: $tag"
+
+            target_id=$(gh api \
+              "repos/$TARGET/releases/tags/$tag" \
+              --jq '.id' 2>/dev/null || true)
+
+            if [[ -n "$target_id" ]]; then
+              echo "Release already exists. Updating..."
+
+              gh api --method PATCH \
+                "repos/$TARGET/releases/$target_id" \
+                -f name="$name" \
+                -f body="$body" \
+                -F draft="$draft" \
+                -F prerelease="$prerelease" \
+                >/dev/null
+            else
+              echo "Creating release..."
+
+              gh api --method POST \
+                "repos/$TARGET/releases" \
+                -f tag_name="$tag" \
+                -f name="$name" \
+                -f body="$body" \
+                -f target_commitish="$target_commitish" \
+                -F draft="$draft" \
+                -F prerelease="$prerelease" \
+                >/dev/null
+            fi
+
+            if [[ "$assets" -gt 0 ]]; then
+              DIR=$(mktemp -d)
+
+              echo "Downloading $assets assets..."
+
+              gh release download "$tag" \
+                --repo "$SOURCE" \
+                --dir "$DIR"
+
+              shopt -s nullglob
+              files=("$DIR"/*)
+
+              if [[ ${#files[@]} -gt 0 ]]; then
+                echo "Uploading assets..."
+
+                gh release upload "$tag" \
+                  "${files[@]}" \
+                  --repo "$TARGET" \
+                  --clobber
+              fi
+
+              rm -rf "$DIR"
+            fi
+
+            echo "Finished: $tag"
+          done
+
+          echo "All releases processed!"
