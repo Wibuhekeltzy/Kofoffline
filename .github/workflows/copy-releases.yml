@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: "Original repository (owner/repo)"
+        description: "Original repository (OWNER/REPO)"
         required: true
         type: string
 
@@ -26,27 +26,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$SOURCE" == "$TARGET" ]]; then
-            echo "Source and destination cannot be the same."
-            exit 1
-          fi
-
           echo "Source: $SOURCE"
           echo "Destination: $TARGET"
 
+          # Fetch source releases
           gh api --paginate --slurp \
             "repos/$SOURCE/releases?per_page=100" \
-            > releases.json
+            > source.json
 
-          count=$(jq '[.[][]] | length' releases.json)
-          echo "Found $count releases."
+          # Fetch destination releases
+          gh api --paginate --slurp \
+            "repos/$TARGET/releases?per_page=100" \
+            > target.json
+
+          count=$(jq '[.[][]] | length' source.json)
+          echo "Found $count source releases."
 
           if [[ "$count" -eq 0 ]]; then
-            echo "No published releases found."
+            echo "No releases found."
             exit 0
           fi
 
-          jq -c '.[][]' releases.json |
+          jq -c '.[][]' source.json |
           while IFS= read -r release; do
 
             tag=$(jq -r '.tag_name' <<< "$release")
@@ -57,14 +58,15 @@ jobs:
             target_commitish=$(jq -r '.target_commitish // "main"' <<< "$release")
             assets=$(jq '.assets | length' <<< "$release")
 
-            echo "Processing release: $tag"
+            echo "Processing: $tag"
 
-            target_id=$(gh api \
-              "repos/$TARGET/releases/tags/$tag" \
-              --jq '.id' 2>/dev/null || true)
+            # Safely find an existing release
+            target_id=$(jq -r --arg tag "$tag" \
+              '[.[][] | select(.tag_name == $tag) | .id][0] // empty' \
+              target.json)
 
             if [[ -n "$target_id" ]]; then
-              echo "Release already exists. Updating..."
+              echo "Updating existing release..."
 
               gh api --method PATCH \
                 "repos/$TARGET/releases/$target_id" \
@@ -74,7 +76,7 @@ jobs:
                 -F prerelease="$prerelease" \
                 >/dev/null
             else
-              echo "Creating release..."
+              echo "Creating new release..."
 
               gh api --method POST \
                 "repos/$TARGET/releases" \
@@ -87,7 +89,9 @@ jobs:
                 >/dev/null
             fi
 
+            # Download and upload release assets
             if [[ "$assets" -gt 0 ]]; then
+
               DIR=$(mktemp -d)
 
               echo "Downloading $assets assets..."
@@ -111,7 +115,8 @@ jobs:
               rm -rf "$DIR"
             fi
 
-            echo "Finished: $tag"
+            echo "Completed: $tag"
+
           done
 
-          echo "All releases processed!"
+          echo "All releases processed successfully!"
